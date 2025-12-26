@@ -1,0 +1,168 @@
+name: Kernel Build (A50/M30S)
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: "Device codename"
+        type: choice
+        required: true
+        options: [a50, m30s]
+        default: m30s
+
+      variant:
+        description: "ROM variant"
+        type: choice
+        required: true
+        options: [oneui, aosp]
+        default: oneui
+
+      android:
+        description: "Android version (OneUI 3 = Android 11)"
+        type: choice
+        required: true
+        options: ["11", "12"]
+        default: "11"
+
+      root:
+        description: "Root integration"
+        type: choice
+        required: true
+        options: [magisk, kernelsu, none]
+        default: none
+
+      magisk_channel:
+        description: "If root=magisk, choose channel"
+        type: choice
+        required: true
+        options: [stable, canary]
+        default: stable
+
+      permissive:
+        description: "Build permissive kernel"
+        type: boolean
+        required: true
+        default: false
+
+      extra_args:
+        description: "Extra args to append to build.sh (optional)"
+        type: string
+        required: false
+        default: ""
+
+  push:
+    branches:
+      - main
+      - master
+      - wip
+      - "wip-*"
+      - "android-*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      TZ: Asia/Kathmandu
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPRESS: "1"
+      CCACHE_MAXSIZE: 8G
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bzip2 jq bc p7zip-full zip unzip rsync \
+            build-essential flex bison libssl-dev libelf-dev \
+            lib32stdc++6 libc6-dev-i386 libncurses5 \
+            python3 python-is-python3 git ccache
+
+      - name: Cache toolchains + ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ccache
+            toolchains
+            toolchain
+            clang
+            proton-clang
+            prebuilts
+            .download
+          key: ${{ runner.os }}-${{ inputs.device }}-${{ inputs.variant }}-a${{ inputs.android }}-${{ inputs.root }}-${{ inputs.magisk_channel }}-p${{ inputs.permissive }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.device }}-${{ inputs.variant }}-a${{ inputs.android }}-
+            ${{ runner.os }}-${{ inputs.device }}-
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          chmod +x ./build.sh
+
+          DEVICE="${{ inputs.device }}"
+          VARIANT="${{ inputs.variant }}"
+          ANDROID="${{ inputs.android }}"
+          ROOT="${{ inputs.root }}"
+          MAGISK_CHANNEL="${{ inputs.magisk_channel }}"
+          PERMISSIVE="${{ inputs.permissive }}"
+          EXTRA="${{ inputs.extra_args }}"
+
+          CMD=( ./build.sh --automated --device "${DEVICE}" --variant "${VARIANT}" --android "${ANDROID}" )
+
+          if [[ "${ROOT}" == "magisk" ]]; then
+            if [[ "${MAGISK_CHANNEL}" == "canary" ]]; then
+              CMD+=( --magisk canary )
+            else
+              CMD+=( --magisk )
+            fi
+          elif [[ "${ROOT}" == "kernelsu" ]]; then
+            CMD+=( --kernelsu )
+          fi
+
+          if [[ "${PERMISSIVE}" == "true" ]]; then
+            CMD+=( --permissive )
+          fi
+
+          # Append any extra args the user provided
+          if [[ -n "${EXTRA}" ]]; then
+            # split on spaces intentionally
+            CMD+=( ${EXTRA} )
+          fi
+
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+
+          # Collect flashable zips produced by build.sh (your existing workflows use Mint*-*.zip)
+          shopt -s nullglob
+          zips=( Mint*-*.zip )
+          if (( ${#zips[@]} == 0 )); then
+            echo "No Mint*-*.zip found. If your output naming changed, update this step."
+            find . -maxdepth 4 -type f -name "*.zip" -print || true
+            exit 1
+          fi
+          mv -f "${zips[@]}" release/
+
+          # Save final config
+          cp -f .config "release/kernel_config_${{ inputs.device }}_${{ inputs.variant }}_android${{ inputs.android }}_${{ inputs.root }}_permissive-${{ inputs.permissive }}.txt"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.device }}-${{ inputs.variant }}-android${{ inputs.android }}-${{ inputs.root }}-permissive${{ inputs.permissive }}-${{ github.run_number }}
+          path: release/
+          if-no-files-found: error
