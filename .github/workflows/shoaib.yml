@@ -1,4 +1,4 @@
-name: Kernel Build (Exynos9610 A50/M30S)
+name: Kernel Build (Exynos9610)
 
 on:
   workflow_dispatch:
@@ -9,55 +9,42 @@ on:
         required: true
         options: [m30s, a50]
         default: m30s
-
       variant:
         description: "Variant"
         type: choice
         required: true
         options: [oneui, aosp]
         default: oneui
-
       android:
         description: "Android version (Android 11 = OneUI 3.x)"
         type: choice
         required: true
         options: ["11", "12"]
         default: "11"
-
       root:
         description: "Root integration"
         type: choice
         required: true
         options: [magisk, kernelsu, none]
         default: magisk
-
       magisk_channel:
-        description: "If root=magisk, choose channel"
+        description: "If root=magisk, channel"
         type: choice
         required: true
         options: [stable, canary]
         default: stable
-
       permissive:
-        description: "Build permissive kernel"
+        description: "Permissive kernel"
         type: boolean
         required: true
         default: false
-
       clean:
-        description: "Clean build (passes --clean if your build.sh supports it)"
+        description: "Clean build"
         type: boolean
         required: true
         default: true
-
-      kernelsu_patch_url:
-        description: "Optional: URL to KernelSU.patch (only used when root=kernelsu)"
-        type: string
-        required: false
-        default: ""
-
       extra_args:
-        description: "Extra args appended to build.sh (optional)"
+        description: "Extra args appended to build.sh"
         type: string
         required: false
         default: ""
@@ -73,10 +60,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: kernel-${{ github.ref }}-${{ github.workflow }}
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -84,18 +67,25 @@ jobs:
 
     env:
       TZ: Asia/Kathmandu
+
+      # IMPORTANT: helps scripts that download from GitHub API avoid rate limits
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_COMPRESS: "1"
       CCACHE_MAXSIZE: 8G
+
       KBUILD_BUILD_USER: github-actions
       KBUILD_BUILD_HOST: github
 
     steps:
-      - name: Checkout (with submodules)
+      - name: Checkout (submodules + LFS)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
+          lfs: true
 
       - name: Install dependencies
         run: |
@@ -104,7 +94,14 @@ jobs:
             bzip2 jq bc p7zip-full zip unzip rsync \
             build-essential flex bison libssl-dev libelf-dev \
             lib32stdc++6 libc6-dev-i386 libncurses5 \
-            python3 python-is-python3 git ccache curl wget ca-certificates
+            python3 python-is-python3 git ccache curl wget ca-certificates \
+            git-lfs file
+
+      - name: Pull Git LFS objects (if used)
+        run: |
+          set -euxo pipefail
+          git lfs install
+          git lfs pull || true
 
       - name: Cache (ccache + common toolchain dirs)
         uses: actions/cache@v4
@@ -122,21 +119,44 @@ jobs:
             ${{ runner.os }}-exy9610-${{ github.ref_name }}-
             ${{ runner.os }}-exy9610-
 
-      - name: Ensure KernelSU Kconfig exists (prevents drivers/Kconfig error)
+      - name: KernelSU setup (only if root=kernelsu)
+        if: ${{ inputs.root == 'kernelsu' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git submodule update --init --recursive || true
+
+          if [ ! -f drivers/kernelsu/Kconfig ]; then
+            echo "drivers/kernelsu/Kconfig missing -> running KernelSU setup.sh"
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          fi
+
+          test -f drivers/kernelsu/Kconfig
+
+      - name: Preflight Magisk (helps debug broken magisk.zip)
+        if: ${{ inputs.root == 'magisk' }}
         shell: bash
         run: |
           set -euxo pipefail
 
-          # First try submodules (in case drivers/kernelsu is a submodule)
-          git submodule update --init --recursive || true
+          # If repo contains a magisk.zip, ensure it is not a tiny HTML/text file.
+          if [ -f usr/magisk/magisk.zip ]; then
+            echo "Found usr/magisk/magisk.zip"
+            ls -lah usr/magisk/magisk.zip
+            file usr/magisk/magisk.zip || true
 
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "drivers/kernelsu/Kconfig missing -> running KernelSU setup.sh to populate it"
-            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+            # If it's tiny, show first bytes (usually reveals HTML/404/rate-limit)
+            size=$(stat -c%s usr/magisk/magisk.zip)
+            if [ "$size" -lt 2000 ]; then
+              echo "magisk.zip is suspiciously small ($size bytes). Showing head:"
+              head -c 300 usr/magisk/magisk.zip | cat -v || true
+              echo
+              echo "This usually means Magisk download/update returned an error page."
+              echo "We continue; build.sh will attempt to update Magisk using GITHUB_TOKEN."
+            fi
+          else
+            echo "No usr/magisk/magisk.zip present in tree; build.sh will fetch it."
           fi
-
-          # Hard fail if still missing (otherwise build will always fail)
-          test -f drivers/kernelsu/Kconfig
 
       - name: Build
         shell: bash
@@ -144,7 +164,6 @@ jobs:
           set -euxo pipefail
           chmod +x ./build.sh
 
-          # Defaults for push runs (workflow_dispatch inputs are empty on push)
           DEVICE="${{ inputs.device }}"
           VARIANT="${{ inputs.variant }}"
           ANDROID="${{ inputs.android }}"
@@ -152,9 +171,9 @@ jobs:
           MAGISK_CHANNEL="${{ inputs.magisk_channel }}"
           PERMISSIVE="${{ inputs.permissive }}"
           CLEAN="${{ inputs.clean }}"
-          KSU_PATCH_URL="${{ inputs.kernelsu_patch_url }}"
           EXTRA="${{ inputs.extra_args }}"
 
+          # Defaults for push runs
           DEVICE="${DEVICE:-m30s}"
           VARIANT="${VARIANT:-oneui}"
           ANDROID="${ANDROID:-11}"
@@ -162,36 +181,10 @@ jobs:
           MAGISK_CHANNEL="${MAGISK_CHANNEL:-stable}"
           PERMISSIVE="${PERMISSIVE:-false}"
           CLEAN="${CLEAN:-true}"
-          KSU_PATCH_URL="${KSU_PATCH_URL:-}"
           EXTRA="${EXTRA:-}"
-
-          echo "=== Build selection ==="
-          echo "DEVICE=$DEVICE"
-          echo "VARIANT=$VARIANT"
-          echo "ANDROID=$ANDROID"
-          echo "ROOT=$ROOT"
-          echo "MAGISK_CHANNEL=$MAGISK_CHANNEL"
-          echo "PERMISSIVE=$PERMISSIVE"
-          echo "CLEAN=$CLEAN"
-          echo "KSU_PATCH_URL=$KSU_PATCH_URL"
-          echo "EXTRA=$EXTRA"
-          echo "======================="
-
-          # If user selected KernelSU, optionally apply a patch (like your existing workflow)
-          if [[ "$ROOT" == "kernelsu" ]]; then
-            if [[ -n "$KSU_PATCH_URL" ]]; then
-              echo "Downloading KernelSU patch..."
-              wget -q "$KSU_PATCH_URL" -O KernelSU.patch
-              echo "Applying KernelSU patch..."
-              git apply ./KernelSU.patch
-            else
-              echo "No kernelsu_patch_url provided; skipping patch step."
-            fi
-          fi
 
           CMD=( ./build.sh --automated --device "$DEVICE" --variant "$VARIANT" --android "$ANDROID" )
 
-          # Root flags
           if [[ "$ROOT" == "magisk" ]]; then
             if [[ "$MAGISK_CHANNEL" == "canary" ]]; then
               CMD+=( --magisk canary )
@@ -202,63 +195,49 @@ jobs:
             CMD+=( --kernelsu )
           fi
 
-          # Permissive flag
           if [[ "$PERMISSIVE" == "true" ]]; then
             CMD+=( --permissive )
           fi
 
-          # Clean flag (only if your build.sh supports it; harmless if it ignores unknown args?)
           if [[ "$CLEAN" == "true" ]]; then
             CMD+=( --clean )
           fi
 
-          # Extra args
           if [[ -n "$EXTRA" ]]; then
             CMD+=( $EXTRA )
           fi
 
           echo "Running: ${CMD[*]}"
-          # Save full log for debugging
           ( "${CMD[@]}" ) 2>&1 | tee build.log
 
-      - name: Collect artifacts (ZIP + config + logs)
+      - name: Collect artifacts
         if: ${{ always() }}
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p release
 
-          # Always keep logs
-          if [ -f build.log ]; then
-            cp -f build.log release/build.log
-          fi
+          # logs
+          [ -f build.log ] && cp -f build.log release/build.log || true
 
-          # Collect flashable zips (your repo workflows use Mint*-*.zip)
+          # zip outputs (your repo commonly uses Mint*-*.zip)
           shopt -s nullglob
-          zips=( Mint*-*.zip )
-          if (( ${#zips[@]} > 0 )); then
-            mv -f "${zips[@]}" release/
+          z1=( Mint*-*.zip )
+          if (( ${#z1[@]} )); then
+            mv -f "${z1[@]}" release/
           else
-            # fallback: try any zip produced
-            anyz=( *.zip )
-            if (( ${#anyz[@]} > 0 )); then
-              mv -f "${anyz[@]}" release/
-            fi
+            z2=( *.zip )
+            (( ${#z2[@]} )) && mv -f "${z2[@]}" release/ || true
           fi
 
-          # Save .config if it exists anywhere
+          # .config (save if exists anywhere)
           if [ -f .config ]; then
             cp -f .config release/kernel_config.txt
           else
             cfg="$(find . -maxdepth 6 -type f -name .config | head -n 1 || true)"
-            if [ -n "$cfg" ]; then
-              cp -f "$cfg" release/kernel_config.txt
-            else
-              echo "No .config found (build may have failed before config generation)."
-            fi
+            [ -n "$cfg" ] && cp -f "$cfg" release/kernel_config.txt || true
           fi
 
-          # Helpful listing
           echo "=== release/ ==="
           ls -lah release || true
 
@@ -266,6 +245,6 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ inputs.device || 'm30s' }}-${{ inputs.variant || 'oneui' }}-android${{ inputs.android || '11' }}-${{ inputs.root || 'magisk' }}-run${{ github.run_number }}
+          name: kernel-${{ inputs.device || 'm30s' }}-${{ inputs.variant || 'oneui' }}-android${{ inputs.android || '11' }}-${{ inputs.root || 'magisk' }}-${{ github.run_number }}
           path: release/
           if-no-files-found: warn
